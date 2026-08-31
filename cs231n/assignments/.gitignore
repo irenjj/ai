@@ -1,0 +1,49 @@
+# Downloaded starter archives
+*_colab.zip
+
+# macOS and editor metadata
+.DS_Store
+.idea/
+.vscode/
+*~
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Jupyter temporary files
+.ipynb_checkpoints/
+
+# Native extension build products
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+
+# Downloaded datasets (keep the download scripts)
+**/cs231n/datasets/*
+!**/cs231n/datasets/*.sh
+assignment3/data/
+
+# Trained models and generated experiment output
+**/saved/*
+!**/saved/keep.md
+assignment3/results/
+assignment3/pretrained_model/
+assignment3/cs231n/exp/pretrained/
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+
+# Generated submission bundles and reports
+a*_code_submission.zip
+a*_inline_submission.pdf
