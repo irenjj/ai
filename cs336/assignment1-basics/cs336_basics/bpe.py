@@ -63,64 +63,6 @@ def count_pretokens_and_pairs(
     return pretoken_counts, count_token_pairs(pretoken_counts)
 
 
-def merge_best_pair(
-    merges: list[tuple[bytes, bytes]],
-    pair_counts: dict[tuple[bytes, bytes], int],
-    pretoken_counts: dict[tuple[bytes, ...], int],
-    vocab: dict[int, bytes],
-) -> None:
-    # 优先取最大频次, 并列时取最大的 pair
-    best_pair, pair_frequency = max(
-        pair_counts.items(),
-        key=lambda kv: (kv[1], kv[0]),
-    )
-    merged_token = best_pair[0] + best_pair[1]
-    merges.append(best_pair)
-
-    # 在每个词中合并所有不重叠的匹配
-    updated_pretoken_counts: Counter[tuple[bytes, ...]] = Counter()
-
-    for token_sequence, count in pretoken_counts.items():
-        merged_tokens = []
-        i = 0
-
-        while i < len(token_sequence):
-            if token_sequence[i: i + 2] == best_pair:
-                merged_tokens.append(merged_token)
-                i += 2
-            else:
-                merged_tokens.append(token_sequence[i])
-                i += 1
-
-        merged_sequence = tuple(merged_tokens)
-        updated_pretoken_counts[merged_sequence] += count
-
-        if merged_sequence != token_sequence:
-            for pair in pairwise(token_sequence):
-                pair_counts[pair] -= count
-
-            for pair in pairwise(merged_sequence):
-                pair_counts[pair] = pair_counts.get(pair, 0) + count
-
-
-    # 合并不改变片段出现次数的总和
-    assert sum(updated_pretoken_counts.values()) == sum(pretoken_counts.values())
-    pretoken_counts.clear()
-    pretoken_counts.update(updated_pretoken_counts)
-
-    vocab[vocab.__len__()] = best_pair[0] + best_pair[1]
-
-    for pair, count in list(pair_counts.items()):
-        assert count >= 0
-        if count == 0:
-            del pair_counts[pair]
-
-    # pair_counts.clear()
-    # pair_counts.update(count_token_pairs(pretoken_counts))
-
-
-
-
 def count_chunk(args):
     input_path, start, end, special_tokens = args
     with open(input_path, "rb") as f:
@@ -131,45 +73,114 @@ def count_chunk(args):
     return count_pretokens(segments)
 
 
-def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str],) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    vocab = init_vocab(special_tokens)
-    merges: list[tuple[bytes, bytes]] = []
+class BPETrainer:
+    """Own the mutable state for BPE training."""
 
-    with open(input_path, "rb") as f:
-        if special_tokens:
-            split_token = max(special_tokens, key=len)
-            if not split_token:
-                raise ValueError("Special tokens must not be empty")
-            boundaries = find_chunk_boundaries(
-                f, NUM_PROCESSES, split_token.encode("utf-8")
-            )
+    def __init__(self, vocab_size: int, special_tokens: list[str]) -> None:
+        self.vocab_size = vocab_size
+        self.special_tokens = list(special_tokens)
+        self.vocab: dict[int, bytes] = {}
+        self.merges: list[tuple[bytes, bytes]] = []
+        self.pretoken_counts: Counter[tuple[bytes, ...]] = Counter()
+        self.pair_counts: Counter[tuple[bytes, bytes]] = Counter()
+
+    def merge_best_pair(self) -> None:
+        # 优先取最大频次, 并列时取最大的 pair
+        best_pair, _ = max(
+            self.pair_counts.items(),
+            key=lambda kv: (kv[1], kv[0]),
+        )
+        merged_token = best_pair[0] + best_pair[1]
+        self.merges.append(best_pair)
+
+        # 在每个词中合并所有不重叠的匹配
+        updated_pretoken_counts: Counter[tuple[bytes, ...]] = Counter()
+
+        for token_sequence, count in self.pretoken_counts.items():
+            merged_tokens = []
+            i = 0
+
+            while i < len(token_sequence):
+                if token_sequence[i: i + 2] == best_pair:
+                    merged_tokens.append(merged_token)
+                    i += 2
+                else:
+                    merged_tokens.append(token_sequence[i])
+                    i += 1
+
+            merged_sequence = tuple(merged_tokens)
+            updated_pretoken_counts[merged_sequence] += count
+
+            if merged_sequence != token_sequence:
+                for pair in pairwise(token_sequence):
+                    self.pair_counts[pair] -= count
+
+                for pair in pairwise(merged_sequence):
+                    self.pair_counts[pair] = self.pair_counts.get(pair, 0) + count
+
+
+        # 合并不改变片段出现次数的总和
+        assert sum(updated_pretoken_counts.values()) == sum(self.pretoken_counts.values())
+        self.pretoken_counts.clear()
+        self.pretoken_counts.update(updated_pretoken_counts)
+
+        self.vocab[self.vocab.__len__()] = best_pair[0] + best_pair[1]
+
+        for pair, count in list(self.pair_counts.items()):
+            assert count >= 0
+            if count == 0:
+                del self.pair_counts[pair]
+
+        # self.pair_counts.clear()
+        # self.pair_counts.update(count_token_pairs(self.pretoken_counts))
+
+    def train(self, input_path: str) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+        self.vocab = init_vocab(self.special_tokens)
+        self.merges: list[tuple[bytes, bytes]] = []
+
+        with open(input_path, "rb") as f:
+            if self.special_tokens:
+                split_token = max(self.special_tokens, key=len)
+                if not split_token:
+                    raise ValueError("Special tokens must not be empty")
+                boundaries = find_chunk_boundaries(
+                    f, NUM_PROCESSES, split_token.encode("utf-8")
+                )
+            else:
+                f.seek(0, 2)
+                boundaries = [0, f.tell()]
+
+        tasks = [
+            (input_path, start, end, self.special_tokens)
+            for start, end in zip(boundaries[:-1], boundaries[1:])
+            if start < end
+        ]
+        self.pretoken_counts: Counter[tuple[bytes, ...]] = Counter()
+        if len(tasks) > 1:
+            with ProcessPoolExecutor(max_workers=NUM_PROCESSES) as executor:
+                for chunk_counts in executor.map(count_chunk, tasks):
+                    self.pretoken_counts.update(chunk_counts)
         else:
-            f.seek(0, 2)
-            boundaries = [0, f.tell()]
+            for task in tasks:
+                self.pretoken_counts.update(count_chunk(task))
 
-    tasks = [
-        (input_path, start, end, special_tokens)
-        for start, end in zip(boundaries[:-1], boundaries[1:])
-        if start < end
-    ]
-    pretoken_counts: Counter[tuple[bytes, ...]] = Counter()
-    if len(tasks) > 1:
-        with ProcessPoolExecutor(max_workers=NUM_PROCESSES) as executor:
-            for chunk_counts in executor.map(count_chunk, tasks):
-                pretoken_counts.update(chunk_counts)
-    else:
-        for task in tasks:
-            pretoken_counts.update(count_chunk(task))
+        self.pair_counts = count_token_pairs(self.pretoken_counts)
 
-    pair_counts = count_token_pairs(pretoken_counts)
+        for _ in range(self.vocab.__len__(), self.vocab_size):
+            if not self.pair_counts:
+                break
 
-    for _ in range(vocab.__len__(), vocab_size):
-        if not pair_counts:
-            break
+            self.merge_best_pair()
 
-        merge_best_pair(merges, pair_counts, pretoken_counts, vocab)
+        return self.vocab, self.merges
 
-    return vocab, merges
+
+def train_bpe(
+    input_path: str,
+    vocab_size: int,
+    special_tokens: list[str],
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    return BPETrainer(vocab_size, special_tokens).train(input_path)
 
 
 if __name__ == "__main__":
