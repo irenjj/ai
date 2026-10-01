@@ -1,8 +1,12 @@
 from collections import Counter
+from collections.abc import Iterable, Iterator
+from copyreg import pickle
 from dataclasses import dataclass
-from heapq import heapify, heappop, heappush
+from heapq import heapify, heappop, heappush, merge
 from itertools import pairwise
 from concurrent.futures import ProcessPoolExecutor
+
+import pickle
 
 if __package__:
     from .pretokenization_example import find_chunk_boundaries
@@ -55,6 +59,16 @@ def split_on_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
         re.escape(token)
         for token in sorted(special_tokens, key=len, reverse=True)
     )
+    return re.split(pattern, text)
+
+def split_on_keep_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
+    if not special_tokens:
+        return [text]
+    pattern = "|".join(
+        re.escape(token)
+        for token in sorted(special_tokens, key=len, reverse=True)
+    )
+    pattern = "(" + pattern + ")"
     return re.split(pattern, text)
 
 
@@ -213,6 +227,117 @@ class BPETrainer:
             self.merge_best_pair()
 
         return self.vocab, self.merges
+
+
+"""
+假设输入字符串是 'the cat ate', 词表为:
+voab: {0: b' ', 1: b'a', 2: b'c', 3: b'e', 4: b'h', 5: b't', 6: b'th', 7: b' c', 8: b' a', 9: b'the', 10: b' at'}
+merges: [(b't', b'h'), (b' ', b'c'), (b' ', b'a'), (b'th', b'e'), (b' a', b't')]
+
+预分词器会将这个切割为 ['the', ' cat', ' ate']
+然后检查每个 token, 并应用 BPE 合并:
+1. 'the': [b't', b'h', b'e'], 查看 merges, 找到第一个可应用的合并(b't', b'h'), 将pretoken 转换成 [b'th', b'e'], 再去 merges, 转换成 [b'the'], 再去 merges, 发现没有可以合并的了, 最后去 vocab, 找到 9
+2. ' cat': 找到 [b' c', b't'], 得到 7, 1, 5
+3. ' ate': 10, 3
+"""
+class Tokenizer:
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ) -> None:
+        self.vocab = dict(vocab)
+        self.merges = list(merges)
+        self.special_tokens = list(special_tokens or [])
+
+        self.token_to_id = {
+            token_bytes: token_id
+            for token_id, token_bytes in self.vocab.items()
+        }
+
+        next_id = max(self.vocab, default=-1) + 1
+        for special_token in self.special_tokens:
+            token_bytes = special_token.encode("utf-8")
+            if token_bytes not in self.token_to_id:
+                self.vocab[next_id] = token_bytes
+                self.token_to_id[token_bytes] = next_id
+                next_id += 1
+
+        self.merge_ranks = {
+            pair: rank
+            for rank, pair in enumerate(self.merges)
+        }
+
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None
+    ):
+
+        with open(vocab_filepath, "rb") as f:
+            vocab = pickle.load(f)
+
+        with open(merges_filepath, "rb") as f:
+            merges = pickle.load(f)
+
+        return cls(vocab, merges, special_tokens)
+
+
+    def encode(self, text: str) -> list[int]:
+        token_ids: list[int] = []
+
+        segments = split_on_keep_special_tokens(text, self.special_tokens)
+
+        for segment in segments:
+            if segment in self.special_tokens:
+                token_ids.append(self.token_to_id[segment.encode("utf-8")])
+            else:
+                pretoken_texts = re.findall(PRETOKEN_PATTERN, segment)
+                for pretoken_text in pretoken_texts:
+                    token_seq = tuple(bytes([byte_value]) for byte_value in pretoken_text.encode("utf-8"))
+                    while len(token_seq) > 1:
+                        candidates = [
+                            pair
+                            for pair in pairwise(token_seq)
+                            if pair in self.merge_ranks
+                        ]
+
+                        if not candidates:
+                            break
+                        best_pair = min(candidates, key=self.merge_ranks.__getitem__)
+                        merged_tokens = []
+                        i = 0
+
+                        while i < len(token_seq):
+                            if token_seq[i:i + 2] == best_pair:
+                                merged_tokens.append(best_pair[0] + best_pair[1])
+                                i += 2
+                            else:
+                                merged_tokens.append(token_seq[i])
+                                i += 1
+
+                        token_seq = tuple(merged_tokens)
+
+                    token_ids.extend(self.token_to_id[token] for token in token_seq)
+        return token_ids
+
+
+    def decode(self, ids: list[int]) -> str:
+        """Decode concatenated token bytes, replacing invalid UTF-8 sequences."""
+        token_bytes = b"".join(self.vocab[token_id] for token_id in ids)
+        return token_bytes.decode("utf-8", errors="replace")
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """Lazily encode each input string independently, preserving its contents.
+
+        Memory is bounded by the current string and its encoded IDs, not the
+        entire iterable. Arbitrary chunk boundaries may change tokenization.
+        """
+        for text in iterable:
+            yield from self.encode(text)
 
 
 def train_bpe(
