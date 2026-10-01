@@ -1,4 +1,6 @@
 from collections import Counter
+from dataclasses import dataclass
+from heapq import heapify, heappop, heappush
 from itertools import pairwise
 from concurrent.futures import ProcessPoolExecutor
 
@@ -73,6 +75,18 @@ def count_chunk(args):
     return count_pretokens(segments)
 
 
+@dataclass(frozen=True, slots=True)
+class _PairCandidate:
+    frequency: int
+    pair: tuple[bytes, bytes]
+
+    def __lt__(self, other: "_PairCandidate") -> bool:
+        # Reverse both priorities so heapq selects the largest frequency and pair.
+        if self.frequency != other.frequency:
+            return self.frequency > other.frequency
+        return self.pair > other.pair
+
+
 class BPETrainer:
     """Own the mutable state for BPE training."""
 
@@ -82,57 +96,81 @@ class BPETrainer:
         self.vocab: dict[int, bytes] = {}
         self.merges: list[tuple[bytes, bytes]] = []
         self.pretoken_counts: Counter[tuple[bytes, ...]] = Counter()
+        # 这个pair 在语料中出现了几次
         self.pair_counts: Counter[tuple[bytes, bytes]] = Counter()
+        self.pair_to_pretokens: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = {}
+        self.pair_heap: list[_PairCandidate] = []
+
+    def build_pair_index(self) -> None:
+        """Index distinct pairs by the current pretoken sequences containing them."""
+        self.pair_to_pretokens.clear()
+        for token_sequence in self.pretoken_counts:
+            for pair in set(pairwise(token_sequence)):
+                self.pair_to_pretokens.setdefault(pair, set()).add(token_sequence)
+
+    def build_pair_heap(self) -> None:
+        self.pair_heap = [
+            _PairCandidate(count, pair) for pair, count in self.pair_counts.items()
+        ]
+        heapify(self.pair_heap)
+
+    def pop_best_pair(self) -> tuple[bytes, bytes]:
+        while self.pair_heap:
+            candidate = heappop(self.pair_heap)
+            if self.pair_counts.get(candidate.pair, 0) == candidate.frequency:
+                return candidate.pair
+        raise RuntimeError("No valid pair candidate remains in the heap")
 
     def merge_best_pair(self) -> None:
-        # 优先取最大频次, 并列时取最大的 pair
-        best_pair, _ = max(
-            self.pair_counts.items(),
-            key=lambda kv: (kv[1], kv[0]),
-        )
+        best_pair = self.pop_best_pair()
         merged_token = best_pair[0] + best_pair[1]
-        self.merges.append(best_pair)
-
-        # 在每个词中合并所有不重叠的匹配
+        # Snapshot before changing the index; remove all old sequences before adding new ones.
+        affected_sequences = tuple(self.pair_to_pretokens[best_pair])
         updated_pretoken_counts: Counter[tuple[bytes, ...]] = Counter()
+        touched_pairs: set[tuple[bytes, bytes]] = set()
 
-        for token_sequence, count in self.pretoken_counts.items():
+        for token_sequence in affected_sequences:
+            count = self.pretoken_counts.pop(token_sequence)
+            old_pairs = Counter(pairwise(token_sequence))
+            for pair, occurrences in old_pairs.items():
+                self.pair_counts[pair] -= occurrences * count
+                touched_pairs.add(pair)
+                members = self.pair_to_pretokens[pair]
+                members.remove(token_sequence)
+                if not members:
+                    del self.pair_to_pretokens[pair]
+
             merged_tokens = []
             i = 0
-
             while i < len(token_sequence):
-                if token_sequence[i: i + 2] == best_pair:
+                if token_sequence[i:i + 2] == best_pair:
                     merged_tokens.append(merged_token)
                     i += 2
                 else:
                     merged_tokens.append(token_sequence[i])
                     i += 1
+            updated_pretoken_counts[tuple(merged_tokens)] += count
 
-            merged_sequence = tuple(merged_tokens)
-            updated_pretoken_counts[merged_sequence] += count
+        for token_sequence, count in updated_pretoken_counts.items():
+            self.pretoken_counts[token_sequence] += count
+            for pair, occurrences in Counter(pairwise(token_sequence)).items():
+                self.pair_counts[pair] += occurrences * count
+                touched_pairs.add(pair)
+                self.pair_to_pretokens.setdefault(pair, set()).add(token_sequence)
 
-            if merged_sequence != token_sequence:
-                for pair in pairwise(token_sequence):
-                    self.pair_counts[pair] -= count
-
-                for pair in pairwise(merged_sequence):
-                    self.pair_counts[pair] = self.pair_counts.get(pair, 0) + count
-
-
-        # 合并不改变片段出现次数的总和
-        assert sum(updated_pretoken_counts.values()) == sum(self.pretoken_counts.values())
-        self.pretoken_counts.clear()
-        self.pretoken_counts.update(updated_pretoken_counts)
-
-        self.vocab[self.vocab.__len__()] = best_pair[0] + best_pair[1]
-
-        for pair, count in list(self.pair_counts.items()):
-            assert count >= 0
-            if count == 0:
+        for pair in touched_pairs:
+            assert self.pair_counts[pair] >= 0
+            if self.pair_counts[pair] == 0:
                 del self.pair_counts[pair]
+            else:
+                heappush(self.pair_heap, _PairCandidate(self.pair_counts[pair], pair))
 
-        # self.pair_counts.clear()
-        # self.pair_counts.update(count_token_pairs(self.pretoken_counts))
+        # Bound stale-entry growth; rebuild from the current authoritative counts.
+        if len(self.pair_heap) > max(64, 4 * len(self.pair_counts)):
+            self.build_pair_heap()
+
+        self.merges.append(best_pair)
+        self.vocab[len(self.vocab)] = merged_token
 
     def train(self, input_path: str) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
         self.vocab = init_vocab(self.special_tokens)
@@ -165,6 +203,8 @@ class BPETrainer:
                 self.pretoken_counts.update(count_chunk(task))
 
         self.pair_counts = count_token_pairs(self.pretoken_counts)
+        self.build_pair_index()
+        self.build_pair_heap()
 
         for _ in range(self.vocab.__len__(), self.vocab_size):
             if not self.pair_counts:
