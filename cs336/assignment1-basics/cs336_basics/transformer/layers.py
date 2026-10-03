@@ -1,6 +1,5 @@
 from torch import nn
-from einops import reduce, einsum
-from math import sqrt
+from einops import rearrange, reduce, einsum
 
 import torch
 import math
@@ -144,7 +143,7 @@ class RotaryPositionalEmbedding(nn.Module):
         super().__init__()
 
         positions = torch.arange(max_seq_len, dtype=torch.float32, device=device) # (max_seq_len,)
-        positions = positions.unsqueeze(-1) # (max_seq_len, 1)
+        positions = rearrange(positions, "position -> position 1") # (max_seq_len, 1)
         exponents = torch.arange(0, d_k, 2, device=device).float() / d_k
         denominators = theta ** exponents # (d_k // 2)
         angles = positions / denominators
@@ -177,22 +176,22 @@ class RotaryPositionalEmbedding(nn.Module):
         cos = self.cos_cached[token_positions]
         sin = self.sin_cached[token_positions]
 
-        # 将相邻特征分成两组
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
+        # 将最后一维拆成相邻特征对，再取出每对的两个成员
+        pairs = rearrange(x, "... (pairs two) -> ... pairs two", two=2)
+        x_even, x_odd = pairs.unbind(dim=-1)
 
         # 每对特征做二维旋转
-        rotated_event = x_even * cos - x_odd * sin
+        rotated_even = x_even * cos - x_odd * sin
         rotated_odd = x_even * sin + x_odd * cos
 
         # [..., a', c'] 和 [..., b', d']
         # -> [..., [a', b'], [c', d']]
         paired = torch.stack(
-            (rotated_event, rotated_odd), dim=-1
+            (rotated_even, rotated_odd), dim=-1
         )
 
         # 合并最后两个维度, 恢复相邻特征的排列
         # -> [..., a', b', c', d']
-        output = paired.flatten(start_dim=-2)
+        output = rearrange(paired, "... pairs two -> ... (pairs two)")
 
         return output.to(x.dtype)
