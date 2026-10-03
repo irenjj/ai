@@ -129,3 +129,70 @@ class SwiGLU(nn.Module):
         w3x = self.w3(x)
 
         return self.w2(w1x_silu * w3x)
+
+class RotaryPositionalEmbedding(nn.Module):
+    cos_cached: torch.Tensor
+    sin_cached: torch.Tensor
+
+    def __init__(
+        self,
+        theta: float,
+        d_k: int,
+        max_seq_len: int,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+
+        positions = torch.arange(max_seq_len, dtype=torch.float32, device=device) # (max_seq_len,)
+        positions = positions.unsqueeze(-1) # (max_seq_len, 1)
+        exponents = torch.arange(0, d_k, 2, device=device).float() / d_k
+        denominators = theta ** exponents # (d_k // 2)
+        angles = positions / denominators
+
+        self.register_buffer(
+            'cos_cached',       # 注册后的属性名
+            angles.cos(),  # 要保存的张量
+            persistent=False,   # 不写入 state_dict
+        )
+
+        self.register_buffer(
+            'sin_cached',
+            angles.sin(),
+            persistent=False
+        )
+
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        输入 query/key 向量及其位置, 输出旋转后的向量
+        """
+
+        # x:                (..., seq_len, d_k)
+        # token_positions:  (..., seq_len,)
+
+        cos = self.cos_cached[token_positions]
+        sin = self.sin_cached[token_positions]
+
+        # 将相邻特征分成两组
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+
+        # 每对特征做二维旋转
+        rotated_event = x_even * cos - x_odd * sin
+        rotated_odd = x_even * sin + x_odd * cos
+
+        # [..., a', c'] 和 [..., b', d']
+        # -> [..., [a', b'], [c', d']]
+        paired = torch.stack(
+            (rotated_event, rotated_odd), dim=-1
+        )
+
+        # 合并最后两个维度, 恢复相邻特征的排列
+        # -> [..., a', b', c', d']
+        output = paired.flatten(start_dim=-2)
+
+        return output.to(x.dtype)
