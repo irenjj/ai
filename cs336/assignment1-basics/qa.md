@@ -110,6 +110,22 @@ einsum(a, b, "i, j -> i j")
 repeat(x, "s -> b s", b=2)
 ```
 
+## FLOPs
+
+考虑一个采用本作业架构, 规模与 GPT-2 XL 相当的模型, 配置如下
+```
+vocab_size(V): 50257
+context_length(S): 1024
+num_layers(L): 48
+d_model(D): 1600
+num_heads(H): 25
+d_ff(F): 4288 (最接近 8/3 * 1600 的 64 的倍数)
+```
+
+FLOPs 概念: 给定输入后, 一次 forward 做了多少次浮点运算.
+
+(m, n) x (n, p) = 2mnp (一次乘法 + 一次加法)
+
 ## Q & A
 
 1. chr(0) 返回哪个 unicode 字符:

@@ -8,6 +8,10 @@ import math
     y           =       W               x
 (d_out x 1)        (d_out x d_in)     (d_in x 1)
 """
+"""
+输入维度 in_features, 输出维度 out_features
+FLOPs = 2 * x.seq_len * in_features * out_features
+"""
 class Linear(nn.Module):
     def __init__(
         self,
@@ -35,6 +39,9 @@ class Linear(nn.Module):
         y = einsum(x, self.weights, "... d_in, d_out d_in -> ... d_out")        
         return y
 
+"""
+查表, 不算入 FLOPs
+"""
 class Embedding(nn.Module):
     def __init__(
         self,
@@ -63,7 +70,9 @@ class Embedding(nn.Module):
         # output: (batch_size, sequence_length, d_model)
         return self.weights[token_ids]
 
-
+"""
+不算入 FLOPs
+"""
 class RMSNorm(nn.Module):
     def __init__(
         self,
@@ -100,7 +109,10 @@ class RMSNorm(nn.Module):
 
         return result.to(in_dtype)
 
-
+"""
+FLOPs = 3 * FLOPs(Linear)
+      = 6 * x.seq_len * d_model * d_ff
+"""
 class SwiGLU(nn.Module):
     def __init__(
         self,
@@ -129,6 +141,10 @@ class SwiGLU(nn.Module):
 
         return self.w2(w1x_silu * w3x)
 
+
+"""
+不算入 FLOPs
+"""
 class RotaryPositionalEmbedding(nn.Module):
     cos_cached: torch.Tensor
     sin_cached: torch.Tensor
