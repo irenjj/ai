@@ -424,7 +424,43 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer.model import TransformerLM
+
+    reference_weight = weights["token_embeddings.weight"]
+    model = TransformerLM(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        vocab_size=vocab_size,
+        context_length=context_length,
+        num_layers=num_layers,
+        theta=rope_theta,
+        use_rope=True,
+        device=reference_weight.device,
+        dtype=reference_weight.dtype,
+    )
+    state_dict = {
+        "token_embedding.weights": weights["token_embeddings.weight"],
+        "norm.weights": weights["ln_final.weight"],
+        "linear.weights": weights["lm_head.weight"],
+    }
+    block_keys = {
+        "mha.wq.weights": "attn.q_proj.weight",
+        "mha.wk.weights": "attn.k_proj.weight",
+        "mha.wv.weights": "attn.v_proj.weight",
+        "mha.wo.weights": "attn.output_proj.weight",
+        "mha_rms_norm.weights": "ln1.weight",
+        "swiglu.w1.weights": "ffn.w1.weight",
+        "swiglu.w2.weights": "ffn.w2.weight",
+        "swiglu.w3.weights": "ffn.w3.weight",
+        "swiglu_norm.weights": "ln2.weight",
+    }
+    for layer_index in range(num_layers):
+        prefix = f"layers.{layer_index}."
+        for model_key, reference_key in block_keys.items():
+            state_dict[prefix + model_key] = weights[prefix + reference_key]
+    model.load_state_dict(state_dict)
+    return model(in_indices)
 
 
 def run_rmsnorm(
