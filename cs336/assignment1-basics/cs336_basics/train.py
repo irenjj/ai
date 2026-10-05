@@ -3,7 +3,10 @@
 import argparse
 import json
 import math
+import time
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -18,6 +21,45 @@ from cs336_basics.nn_utils import (
 )
 from cs336_basics.optimizer import AdamW
 from cs336_basics.transformer.model import TransformerLM
+
+
+class ExperimentLogger:
+    """每次启动单独保存 JSONL；耗时含验证和保存，不含数据/模型初始化。"""
+
+    def __init__(self, log_dir: Path, run_id: str, device: torch.device):
+        self.run_id = run_id
+        self.session_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
+        directory = log_dir / run_id
+        directory.mkdir(parents=True, exist_ok=True)
+        self.path = directory / f"{self.session_id}.jsonl"
+        self.device = device
+        self.file = self.path.open("x", encoding="utf-8")
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        self.started = time.perf_counter()
+
+    def log(self, event: str, step: int, **values) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        record = {
+            "run_id": self.run_id,
+            "session_id": self.session_id,
+            "event": event,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "step": step,
+            "elapsed_seconds": time.perf_counter() - self.started,
+            **values,
+        }
+        line = json.dumps(record, default=str, ensure_ascii=False)
+        self.file.write(line + "\n")
+        self.file.flush()
+        print(line, flush=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.file.close()
 
 
 def load_dataset(path: Path, dtype: str, context_length: int, vocab_size: int) -> np.ndarray:
@@ -85,6 +127,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--run-id", help="Experiment name; reuse on resume to group session logs")
+    parser.add_argument("--log-dir", type=Path, default=Path("runs"))
+    parser.add_argument("--notes", default="", help="Experiment purpose or changes from the baseline")
     args = parser.parse_args()
     for name in ("vocab_size", "context_length", "d_model", "num_layers", "num_heads", "d_ff",
                  "batch_size", "steps", "log_every", "eval_every", "eval_batches", "save_every"):
@@ -101,6 +146,10 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"{name} must be finite and positive")
     if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
         parser.error("weight_decay must be finite and nonnegative")
+    if args.run_id is None:
+        args.run_id = datetime.now(UTC).strftime("run-%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
+    if not args.run_id or args.run_id in (".", "..") or any(c in args.run_id for c in "/\\"):
+        parser.error("run-id must be a nonempty directory name without path separators")
     return args
 
 
@@ -123,36 +172,49 @@ def main() -> None:
     if not isinstance(completed, int) or not 0 <= completed <= args.steps:
         raise ValueError("Checkpoint iteration must be between zero and --steps")
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    # 将运行配置随日志输出，便于复现实验及恢复时提供相同的模型/调度配置。
-    print(json.dumps({"config": vars(args), "resumed_steps": completed}, default=str), flush=True)
-    model.train()
-    loss_sum = 0.0
-    logged_steps = 0
-    for step in range(completed, args.steps):
-        lr = learning_rate_schedule(step, args.warmup_steps, args.decay_steps, args.max_lr, args.min_lr)
-        optimizer.param_groups[0]["lr"] = lr
-        inputs, targets = get_batch(train_data, args.batch_size, args.context_length, args.device)
-        optimizer.zero_grad(set_to_none=True)
-        loss = cross_entropy(model(inputs), targets)
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"Non-finite loss at step {step}")
-        loss.backward()
-        gradient_clipping(model.parameters(), args.max_grad_norm)
-        optimizer.step()
-        completed = step + 1
-        loss_sum += loss.item()
-        logged_steps += 1
-        if completed % args.log_every == 0 or completed == args.steps:
-            print(json.dumps({"step": completed, "lr": lr, "train_loss": loss_sum / logged_steps}), flush=True)
-            loss_sum, logged_steps = 0.0, 0
-        if completed % args.eval_every == 0 or completed == args.steps:
-            val_loss = evaluate(model, val_data, args.batch_size, args.context_length, args.device, args.eval_batches)
-            print(json.dumps({"step": completed, "val_loss": val_loss}), flush=True)
-        if completed % args.save_every == 0 or completed == args.steps:
-            # 先写临时文件，再替换，避免中途退出破坏已有检查点。
-            temporary = args.checkpoint.with_name(args.checkpoint.name + ".tmp")
-            save_checkpoint(model, optimizer, completed, temporary)
-            temporary.replace(args.checkpoint)
+    with ExperimentLogger(args.log_dir, args.run_id, device) as logger:
+        logger.log(
+            "start", completed, config=vars(args), resumed_steps=completed,
+            parameter_count=sum(p.numel() for p in model.parameters()),
+            optimizer_config={k: v for k, v in optimizer.param_groups[0].items() if k != "params"},
+            log_file=str(logger.path.resolve()),
+            timing_scope="Current session only; includes validation/checkpoints, excludes initialization and downtime",
+        )
+        model.train()
+        loss_sum = 0.0
+        logged_steps = 0
+        final_val_loss = None
+        session_start_step = completed
+        for step in range(completed, args.steps):
+            lr = learning_rate_schedule(step, args.warmup_steps, args.decay_steps, args.max_lr, args.min_lr)
+            optimizer.param_groups[0]["lr"] = lr
+            inputs, targets = get_batch(train_data, args.batch_size, args.context_length, args.device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = cross_entropy(model(inputs), targets)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Non-finite loss at step {step}")
+            loss.backward()
+            gradient_clipping(model.parameters(), args.max_grad_norm)
+            optimizer.step()
+            completed = step + 1
+            loss_sum += loss.item()
+            logged_steps += 1
+            if completed % args.log_every == 0 or completed == args.steps:
+                logger.log("train", completed, lr=lr, train_loss=loss_sum / logged_steps, averaged_steps=logged_steps)
+                loss_sum, logged_steps = 0.0, 0
+            if completed % args.eval_every == 0 or completed == args.steps:
+                val_loss = evaluate(model, val_data, args.batch_size, args.context_length, args.device, args.eval_batches)
+                final_val_loss = val_loss
+                logger.log("validation", completed, val_loss=val_loss, eval_batches=args.eval_batches)
+            if completed % args.save_every == 0 or completed == args.steps:
+                # 先写临时文件，再替换，避免中途退出破坏已有检查点。
+                temporary = args.checkpoint.with_name(args.checkpoint.name + ".tmp")
+                save_checkpoint(model, optimizer, completed, temporary)
+                temporary.replace(args.checkpoint)
+                logger.log("checkpoint", completed, checkpoint=str(args.checkpoint.resolve()))
+
+        logger.log("finished", completed, completed_this_session=completed - session_start_step,
+                   val_loss=final_val_loss)
 
 
 if __name__ == "__main__":
