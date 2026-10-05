@@ -1,7 +1,7 @@
 from einops import rearrange, reduce
 from math import cos
 from collections.abc import Iterable
-from torch import nn, Tensor
+from torch import nn
 from numpy import ndarray
 
 import torch
@@ -136,3 +136,51 @@ def load_checkpoint(
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     return checkpoint["iteration"]
+
+@torch.no_grad()
+def generate(
+    model: nn.Module,
+    prompt_ids: torch.Tensor,
+    max_new_tokens: int,
+    eos_token_id: int,
+    context_length: int,
+    temperature: float,
+    top_p: float,
+) -> torch.Tensor:
+    """生成单条序列，返回原始 prompt 和新 token（包含采样到的 EOS）。"""
+    if prompt_ids.ndim != 1 or prompt_ids.numel() == 0 or prompt_ids.dtype != torch.long:
+        raise ValueError("prompt_ids must be a nonempty one-dimensional torch.long tensor")
+    if max_new_tokens < 0 or context_length <= 0:
+        raise ValueError("max_new_tokens must be nonnegative and context_length positive")
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("temperature must be finite and positive")
+    if not 0 < top_p <= 1:
+        raise ValueError("top_p must be in (0, 1]")
+
+    output = prompt_ids.clone()
+    was_training = model.training
+    model.eval()
+    try:
+        for _ in range(max_new_tokens):
+            # 保留完整输出，但模型只接收最近的上下文窗口。
+            context = rearrange(output[-context_length:], "t -> 1 t")
+            logits = model(context)[0, -1, :]
+            probs = softmax(logits / temperature, -1)
+
+            sorted_probs, sorted_ids = torch.sort(probs, descending=True)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            # 用前一个位置的累计概率，保留首次跨过阈值的候选。
+            remove = cumulative >= top_p
+            remove[1:] = remove[:-1].clone()
+            remove[0] = False
+            filtered_probs = sorted_probs.masked_fill(remove, 0.0)
+            filtered_probs = filtered_probs / filtered_probs.sum()
+
+            sampled_index = torch.multinomial(filtered_probs, num_samples=1)
+            next_token = sorted_ids[sampled_index]
+            output = torch.cat([output, next_token], dim=0)
+            if next_token.item() == eos_token_id:
+                break
+    finally:
+        model.train(was_training)
+    return output
