@@ -1,10 +1,12 @@
 from einops import rearrange, reduce
 from math import cos
 from collections.abc import Iterable
-from torch import nn
+from torch import nn, Tensor
+from numpy import ndarray
 
 import torch
 import math
+import numpy as np
 
 def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
     exp_x = torch.exp(x - torch.max(x, dim=dim, keepdim=True).values)
@@ -72,3 +74,39 @@ def gradient_clipping(parameters: Iterable[nn.Parameter], max_l2_norm: float) ->
         scale = max_l2_norm / (total_norm + 1e-6)
         for grad in grads:
             grad.mul_(scale)
+
+def get_batch(
+    dataset: ndarray,
+    batch_size: int,
+    context_length: int,
+    device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    (
+      (batch_size, context_length), (batch_size, context_length)
+    )
+    """
+    n = dataset.__len__()
+
+    inputs = []
+    targets = []
+    for _ in range(0, batch_size):
+        i = np.random.randint(0, n - context_length)
+        input = torch.tensor(
+            dataset[i : i + context_length],
+            dtype=torch.long,
+            device=device,
+        )
+        target = torch.tensor(
+            dataset[i + 1 : i + context_length + 1],
+            dtype=torch.long,
+            device=device,
+        )
+
+        inputs.append(input)
+        targets.append(target)
+
+    return (
+        rearrange(inputs, "b s -> b s"),
+        rearrange(targets, "b s -> b s")
+    )
