@@ -1,6 +1,8 @@
 from einops import einsum, rearrange, reduce
+from math import cos
 
 import torch
+import math
 
 def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
     exp_x = torch.exp(x - torch.max(x, dim=dim, keepdim=True).values)
@@ -31,3 +33,25 @@ def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
 
     losses = torch.log(sum_logits) - selected
     return losses.mean()
+
+
+def learning_rate_schedule(
+    t: int,
+    tw: int,
+    tc: int,
+    max_lr: float,
+    min_lr: float,
+) -> float:
+    lr: float
+    if t < tw:
+        lr = t / tw * max_lr
+    elif tw <= t <= tc:
+        lr = min_lr
+
+        delta = (max_lr - min_lr) * (1 + cos((t - tw) / (tc - tw) * math.pi)) / 2
+
+        lr += delta
+    else:
+        lr = min_lr
+
+    return lr
