@@ -7,6 +7,8 @@ from numpy import ndarray
 import torch
 import math
 import numpy as np
+import os
+import typing
 
 def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
     exp_x = torch.exp(x - torch.max(x, dim=dim, keepdim=True).values)
@@ -110,3 +112,27 @@ def get_batch(
         rearrange(inputs, "b s -> b s"),
         rearrange(targets, "b s -> b s")
     )
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+) -> None:
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "iteration": iteration,
+    }
+    torch.save(checkpoint, out)
+
+
+def load_checkpoint(
+    src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer
+) -> int:
+    checkpoint = torch.load(src, map_location="cpu", weights_only=True)
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    return checkpoint["iteration"]
