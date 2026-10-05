@@ -1,5 +1,7 @@
-from einops import einsum, rearrange, reduce
+from einops import rearrange, reduce
 from math import cos
+from collections.abc import Iterable
+from torch import nn
 
 import torch
 import math
@@ -55,3 +57,18 @@ def learning_rate_schedule(
         lr = min_lr
 
     return lr
+
+
+@torch.no_grad()
+def gradient_clipping(parameters: Iterable[nn.Parameter], max_l2_norm: float) -> None:
+    """按全局 L2 范数原地裁剪梯度，跳过没有梯度的参数。"""
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return
+
+    total_sq = sum(reduce(grad.square(), "... ->", "sum") for grad in grads)
+    total_norm = torch.sqrt(total_sq)
+    if total_norm >= max_l2_norm:
+        scale = max_l2_norm / (total_norm + 1e-6)
+        for grad in grads:
+            grad.mul_(scale)
