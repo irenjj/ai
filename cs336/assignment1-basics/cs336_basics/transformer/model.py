@@ -18,6 +18,7 @@ class TransformerLM(nn.Module):
         eps: float = 1e-5,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        use_rmsnorm: bool = True,
     ):
         super().__init__()
 
@@ -33,10 +34,11 @@ class TransformerLM(nn.Module):
                 eps=eps,
                 device=device,
                 dtype=dtype,
+                use_rmsnorm=use_rmsnorm,
             )
             for _ in range(num_layers)
         ])
-        self.norm = RMSNorm(d_model, eps, device, dtype)
+        self.norm = RMSNorm(d_model, eps, device, dtype) if use_rmsnorm else nn.Identity()
         self.linear = Linear(d_model, vocab_size, device, dtype)
 
         # Transformer Block 层数

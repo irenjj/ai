@@ -20,6 +20,7 @@ from cs336_basics.nn_utils import (
     save_checkpoint,
 )
 from cs336_basics.optimizer import AdamW
+from cs336_basics.training_diagnostics import capture_activations, parameter_stats
 from cs336_basics.transformer.model import TransformerLM
 
 
@@ -111,7 +112,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d-ff", type=int, default=704)
     parser.add_argument("--theta", type=float, default=10000.0)
     parser.add_argument("--norm-eps", type=float, default=1e-5)
+    parser.add_argument("--no-rmsnorm", action="store_true",
+                        help="Ablation: remove all block and final RMSNorm layers")
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--overfit-one-batch", action="store_true",
+                        help="Debug training by reusing one sampled minibatch for every update")
     parser.add_argument("--steps", type=int, default=10000, help="Total updates, including resumed updates")
     parser.add_argument("--max-lr", type=float, default=3e-4)
     parser.add_argument("--min-lr", type=float, default=3e-5)
@@ -164,6 +169,7 @@ def main() -> None:
         d_model=args.d_model, num_heads=args.num_heads, d_ff=args.d_ff,
         vocab_size=args.vocab_size, context_length=args.context_length,
         num_layers=args.num_layers, theta=args.theta, eps=args.norm_eps,
+        use_rmsnorm=not args.no_rmsnorm,
         device=device, dtype=torch.float32,
     )
     optimizer = AdamW(model.parameters(), lr=args.max_lr, betas=tuple(args.betas),
@@ -185,16 +191,33 @@ def main() -> None:
         logged_steps = 0
         final_val_loss = None
         session_start_step = completed
+        fixed_batch = (get_batch(train_data, args.batch_size, args.context_length, args.device)
+                       if args.overfit_one_batch else None)
         for step in range(completed, args.steps):
             lr = learning_rate_schedule(step, args.warmup_steps, args.decay_steps, args.max_lr, args.min_lr)
             optimizer.param_groups[0]["lr"] = lr
-            inputs, targets = get_batch(train_data, args.batch_size, args.context_length, args.device)
+            inputs, targets = (fixed_batch if fixed_batch is not None else
+                               get_batch(train_data, args.batch_size, args.context_length, args.device))
             optimizer.zero_grad(set_to_none=True)
-            loss = cross_entropy(model(inputs), targets)
+            sample_norms = (step + 1) % args.log_every == 0 or step + 1 == args.steps
+            with capture_activations(model, enabled=sample_norms) as activations:
+                loss = cross_entropy(model(inputs), targets)
             if not torch.isfinite(loss):
+                logger.log("nonfinite_loss", step + 1, activations=activations)
                 raise FloatingPointError(f"Non-finite loss at step {step}")
             loss.backward()
+            if sample_norms:
+                weights = parameter_stats(model)
+                gradients_before = parameter_stats(model, gradients=True)
             gradient_clipping(model.parameters(), args.max_grad_norm)
+            if sample_norms:
+                logger.log(
+                    "diagnostics", step + 1,
+                    timing="Current training batch; weights before optimizer update",
+                    activations=activations, weights=weights,
+                    gradients_before_clip=gradients_before,
+                    gradients_after_clip=parameter_stats(model, gradients=True),
+                )
             optimizer.step()
             completed = step + 1
             loss_sum += loss.item()

@@ -17,6 +17,7 @@ class TransformerBlock(nn.Module):
         eps: float = 1e-5,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        use_rmsnorm: bool = True,
     ):
         super().__init__()
 
@@ -31,7 +32,7 @@ class TransformerBlock(nn.Module):
             d_model,
             eps,
             device,
-            dtype)
+            dtype) if use_rmsnorm else nn.Identity()
 
         self.swiglu = SwiGLU(d_model, d_ff, device, dtype)
         self.swiglu_norm = RMSNorm(
@@ -39,7 +40,7 @@ class TransformerBlock(nn.Module):
             eps,
             device,
             dtype
-        )
+        ) if use_rmsnorm else nn.Identity()
 
     def forward(
         self,

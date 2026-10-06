@@ -23,15 +23,11 @@ def init_vocab(special_tokens: list[str]) -> dict[int, bytes]:
 
 
 def count_pretokens(text_segments: list[str]) -> Counter[tuple[bytes, ...]]:
-    pretoken_counts: Counter[tuple[bytes, ...]] = Counter()
-
+    text_counts: Counter[str] = Counter()
     for segment in text_segments:
-        pretoken_texts = re.findall(PRETOKEN_PATTERN, segment)
-        for pretoken_text in pretoken_texts:
-            token_sequence = tuple(bytes([byte_value]) for byte_value in pretoken_text.encode("utf-8"))
-            pretoken_counts[token_sequence] += 1
-
-    return pretoken_counts
+        text_counts.update(re.findall(PRETOKEN_PATTERN, segment))
+    return Counter({tuple(bytes([value]) for value in text.encode("utf-8")): count
+                    for text, count in text_counts.items()})
 
 
 def count_token_pairs(
@@ -131,7 +127,8 @@ def count_chunk(args):
     return count_pretokens(segments)
 
 
-def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str],) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str], *,
+              progress=None) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     vocab = init_vocab(special_tokens)
     merges: list[tuple[bytes, bytes]] = []
 
@@ -162,12 +159,16 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str],) -> t
             pretoken_counts.update(count_chunk(task))
 
     pair_counts = count_token_pairs(pretoken_counts)
+    if progress:
+        progress(len(vocab), len(pretoken_counts))
 
     for _ in range(vocab.__len__(), vocab_size):
         if not pair_counts:
             break
 
         merge_best_pair(merges, pair_counts, pretoken_counts, vocab)
+        if progress and (len(vocab) % 250 == 0 or len(vocab) == vocab_size):
+            progress(len(vocab), len(pretoken_counts))
 
     return vocab, merges
 
