@@ -1,56 +1,59 @@
 import argparse
-import csv
 import json
 import re
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def parse_mmlu_response(text: str) -> str | None:
-    match = re.match(r"The correct answer is\s+([ABCD])\b", text.lstrip())
-    return match.group(1) if match else None
+_NUMBER_PATTERN = re.compile(r"[+-]?(?:\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)")
 
 
-def load_mmlu(data_dir: Path) -> list[dict]:
+def parse_gsm8k_response(model_output: str) -> str | None:
+    """Return the last numeric answer, removing thousands separators."""
+    matches = list(_NUMBER_PATTERN.finditer(model_output))
+    if not matches:
+        return None
+    return matches[-1].group().replace(",", "")
+
+
+def answers_equal(prediction: str | None, answer: str) -> bool:
+    if prediction is None:
+        return False
+    try:
+        return Decimal(prediction) == Decimal(answer)
+    except InvalidOperation:
+        return False
+
+
+def load_gsm8k(data_path: Path) -> list[dict]:
     examples = []
-
-    for path in sorted(data_dir.glob("*_test.csv")):
-        subject = path.stem.removesuffix("_test")
-
-        with path.open(encoding="utf-8", newline="") as f:
-            for row_number, row in enumerate(csv.reader(f), start=1):
-                if len(row) != 6 or row[5] not in "ABCD" or len(row[5]) != 1:
-                    raise ValueError(
-                        f"Invalid MMLU row: {path}:{row_number}"
-                    )
-
-                examples.append({
-                    "id": f"{subject}:{row_number}",
-                    "subject": subject,
-                    "question": row[0],
-                    "options": row[1:5],
-                    "answer": row[5],
-                })
-
+    with data_path.open(encoding="utf-8") as stream:
+        for row_number, line in enumerate(stream, start=1):
+            raw = json.loads(line)
+            question, reference = raw["question"], raw["answer"]
+            if not isinstance(question, str) or not isinstance(reference, str):
+                raise ValueError(f"Invalid GSM8K row: {data_path}:{row_number}")
+            _, separator, gold_text = reference.rpartition("####")
+            answer = parse_gsm8k_response(gold_text)
+            if not separator or answer is None:
+                raise ValueError(f"Missing gold answer: {data_path}:{row_number}")
+            examples.append({
+                "id": f"gsm8k:{row_number}",
+                "question": question,
+                "reference_answer": reference,
+                "answer": answer,
+            })
     if not examples:
-        raise ValueError(f"No MMLU test examples found in {data_dir}")
-
+        raise ValueError(f"No GSM8K examples found in {data_path}")
     return examples
 
 
-def format_prompt(
-    example: dict,
-    task_template: str,
-    system_template: str,
-) -> str:
-    instruction = task_template.format(
-        subject=example["subject"].replace("_", " "),
-        question=example["question"],
-        options=example["options"],
-    )
+def format_prompt(example: dict, task_template: str, system_template: str) -> str:
+    instruction = task_template.format(question=example["question"])
     return system_template.format(instruction=instruction)
 
 
@@ -68,33 +71,41 @@ def main():
         default="/home/renjj/models/Meta-Llama-3.1-8B",
     )
     parser.add_argument(
-        "--data-dir",
+        "--data-path",
         type=Path,
-        default=REPO_ROOT / "data/mmlu/test",
+        default=REPO_ROOT / "data/gsm8k/test.jsonl",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=REPO_ROOT / "outputs/safety/baseline/mmlu",
+        default=REPO_ROOT / "outputs/safety/baseline/gsm8k",
     )
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-id", type=int, default=0)
     args = parser.parse_args()
 
     if args.batch_size <= 0 or args.max_new_tokens <= 0:
         parser.error("batch-size and max-new-tokens must be positive")
     if args.limit is not None and args.limit <= 0:
         parser.error("limit must be positive")
+    if args.num_shards <= 0 or not 0 <= args.shard_id < args.num_shards:
+        parser.error("shard-id must be in [0, num-shards)")
     if not torch.cuda.is_available():
         raise RuntimeError("This script requires a CUDA GPU.")
 
-    examples = load_mmlu(args.data_dir)
+    examples = load_gsm8k(args.data_path)
     if args.limit is not None:
         examples = examples[:args.limit]
 
+    examples = examples[args.shard_id::args.num_shards]
+    if not examples:
+        parser.error("This shard contains no examples")
+
     prompt_dir = REPO_ROOT / "cs336_alignment/prompts_safety"
-    task_template = (prompt_dir / "mmlu_zero_shot.prompt").read_text(
+    task_template = (prompt_dir / "gsm8k_zero_shot.prompt").read_text(
         encoding="utf-8"
     )
     system_template = (
@@ -185,8 +196,8 @@ def main():
 
             for example, prompt, raw_output in zip(batch, prompts, outputs):
                 output = raw_output.split("# Query:", 1)[0].strip()
-                prediction = parse_mmlu_response(output)
-                correct = prediction == example["answer"]
+                prediction = parse_gsm8k_response(output)
+                correct = answers_equal(prediction, example["answer"])
 
                 correct_count += int(correct)
                 parse_failures += int(prediction is None)
@@ -212,7 +223,9 @@ def main():
 
     metrics = {
         "model": args.model,
-        "data_dir": str(args.data_dir),
+        "data_path": str(args.data_path),
+        "num_shards": args.num_shards,
+        "shard_id": args.shard_id,
         "num_examples": len(examples),
         "correct": correct_count,
         "accuracy": correct_count / len(examples),

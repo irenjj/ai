@@ -357,7 +357,14 @@ def get_packed_sft_dataset(
         "input_ids" contains the token IDs for the language modeling inputs, and "labels" contains
         the token IDs for the language modeling labels.
     """
-    raise NotImplementedError
+    from cs336_alignment.data.sft_dataset import SFTDataset
+
+    return SFTDataset(
+        tokenizer=tokenizer,
+        dataset_path=dataset_path,
+        seq_length=seq_length,
+        shuffle=shuffle,
+    )
 
 
 def run_iterate_batches(
@@ -380,7 +387,13 @@ def run_iterate_batches(
     Returns:
         Iterable over batches, where each batch has size `batch_size`.
     """
-    raise NotImplementedError
+    from cs336_alignment.data.sft_dataset import iterate_batches
+
+    return iterate_batches(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+    )
 
 
 def run_parse_mmlu_response(
@@ -425,7 +438,9 @@ def run_parse_gsm8k_response(
         str with the predicted numeric answer if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+    from cs336_alignment.safety.evaluation.gsm8k import parse_gsm8k_response
+
+    return parse_gsm8k_response(model_output)
 
 
 def run_compute_per_instance_dpo_loss(

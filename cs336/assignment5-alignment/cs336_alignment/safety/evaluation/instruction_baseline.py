@@ -1,7 +1,6 @@
 import argparse
 import csv
 import json
-import re
 import time
 from pathlib import Path
 
@@ -9,52 +8,46 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def parse_mmlu_response(text: str) -> str | None:
-    match = re.match(r"The correct answer is\s+([ABCD])\b", text.lstrip())
-    return match.group(1) if match else None
+TASKS = {
+    "alpaca_eval": {
+        "data": "data/alpaca_eval/alpaca_eval_gpt4_turbo.json",
+        "template": "alpaca_eval_zero_shot.prompt",
+    },
+    "simple_safety_tests": {
+        "data": "data/simple_safety_tests/simple_safety_tests.csv",
+        "template": "simple_safety_tests_zero_shot.prompt",
+    },
+}
 
 
-def load_mmlu(data_dir: Path) -> list[dict]:
-    examples = []
-
-    for path in sorted(data_dir.glob("*_test.csv")):
-        subject = path.stem.removesuffix("_test")
-
-        with path.open(encoding="utf-8", newline="") as f:
-            for row_number, row in enumerate(csv.reader(f), start=1):
-                if len(row) != 6 or row[5] not in "ABCD" or len(row[5]) != 1:
-                    raise ValueError(
-                        f"Invalid MMLU row: {path}:{row_number}"
-                    )
-
-                examples.append({
-                    "id": f"{subject}:{row_number}",
-                    "subject": subject,
-                    "question": row[0],
-                    "options": row[1:5],
-                    "answer": row[5],
-                })
-
-    if not examples:
-        raise ValueError(f"No MMLU test examples found in {data_dir}")
-
+def load_examples(task: str, data_path: Path) -> list[dict]:
+    if task == "alpaca_eval":
+        raw = json.loads(data_path.read_text(encoding="utf-8"))
+        examples = [
+            {"id": f"alpaca_eval:{i}", "instruction": item["instruction"],
+             "dataset": item["dataset"]}
+            for i, item in enumerate(raw, start=1)
+        ]
+    elif task == "simple_safety_tests":
+        with data_path.open(encoding="utf-8", newline="") as stream:
+            examples = [dict(row) for row in csv.DictReader(stream)]
+        for item in examples:
+            item["instruction"] = item["prompts_final"]
+    else:
+        raise ValueError(f"Unknown task: {task}")
+    if not examples or any(not isinstance(e["instruction"], str) or not e["instruction"].strip() for e in examples):
+        raise ValueError(f"Missing instructions in {data_path}")
+    if len({e["id"] for e in examples}) != len(examples):
+        raise ValueError(f"Duplicate sample IDs in {data_path}")
     return examples
 
 
-def format_prompt(
-    example: dict,
-    task_template: str,
-    system_template: str,
-) -> str:
-    instruction = task_template.format(
-        subject=example["subject"].replace("_", " "),
-        question=example["question"],
-        options=example["options"],
-    )
+def format_prompt(example: dict, task_template: str, system_template: str) -> str:
+    instruction = task_template.format(instruction=example["instruction"])
     return system_template.format(instruction=instruction)
 
 
-def main():
+def main(task: str):
     import torch
     from transformers import (
         AutoModelForCausalLM,
@@ -68,33 +61,42 @@ def main():
         default="/home/renjj/models/Meta-Llama-3.1-8B",
     )
     parser.add_argument(
-        "--data-dir",
+        "--data-path",
         type=Path,
-        default=REPO_ROOT / "data/mmlu/test",
+        default=REPO_ROOT / TASKS[task]["data"],
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=REPO_ROOT / "outputs/safety/baseline/mmlu",
+        default=REPO_ROOT / f"outputs/safety/baseline/{task}",
     )
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--generator", default="llama-3.1-8b-base")
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-id", type=int, default=0)
     args = parser.parse_args()
 
     if args.batch_size <= 0 or args.max_new_tokens <= 0:
         parser.error("batch-size and max-new-tokens must be positive")
     if args.limit is not None and args.limit <= 0:
         parser.error("limit must be positive")
+    if args.num_shards <= 0 or not 0 <= args.shard_id < args.num_shards:
+        parser.error("shard-id must be in [0, num-shards)")
     if not torch.cuda.is_available():
         raise RuntimeError("This script requires a CUDA GPU.")
 
-    examples = load_mmlu(args.data_dir)
+    examples = load_examples(task, args.data_path)
     if args.limit is not None:
         examples = examples[:args.limit]
 
+    examples = examples[args.shard_id::args.num_shards]
+    if not examples:
+        parser.error("This shard contains no examples")
+
     prompt_dir = REPO_ROOT / "cs336_alignment/prompts_safety"
-    task_template = (prompt_dir / "mmlu_zero_shot.prompt").read_text(
+    task_template = (prompt_dir / TASKS[task]["template"]).read_text(
         encoding="utf-8"
     )
     system_template = (
@@ -142,8 +144,7 @@ def main():
             "choose a new --output-dir."
         )
 
-    correct_count = 0
-    parse_failures = 0
+    records = []
     generation_seconds = 0.0
     evaluation_start = time.perf_counter()
 
@@ -185,38 +186,31 @@ def main():
 
             for example, prompt, raw_output in zip(batch, prompts, outputs):
                 output = raw_output.split("# Query:", 1)[0].strip()
-                prediction = parse_mmlu_response(output)
-                correct = prediction == example["answer"]
-
-                correct_count += int(correct)
-                parse_failures += int(prediction is None)
-
                 record = {
                     **example,
                     "prompt": prompt,
                     "raw_output": raw_output,
                     "output": output,
-                    "prediction": prediction,
-                    "score": int(correct),
+                    "generator": args.generator,
                 }
+                records.append(record)
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
             f.flush()
             processed = start + len(batch)
             print(
-                f"{processed}/{len(examples)} "
-                f"accuracy={correct_count / processed:.4f} "
-                f"parse_failures={parse_failures}",
+                f"{processed}/{len(examples)}",
                 flush=True,
             )
 
     metrics = {
         "model": args.model,
-        "data_dir": str(args.data_dir),
+        "data_path": str(args.data_path),
+        "num_shards": args.num_shards,
+        "shard_id": args.shard_id,
         "num_examples": len(examples),
-        "correct": correct_count,
-        "accuracy": correct_count / len(examples),
-        "parse_failures": parse_failures,
+        "task": task,
+        "generator": args.generator,
         "generation_seconds": generation_seconds,
         "generation_examples_per_second": (
             len(examples) / generation_seconds
@@ -227,12 +221,16 @@ def main():
         "decoding": "greedy",
         "stop_strings": ["# Query:"],
     }
+    if task == "alpaca_eval":
+        (args.output_dir / "model_outputs.json").write_text(
+            json.dumps([{k: r[k] for k in ("instruction", "output", "generator", "dataset")}
+                        for r in records], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     metrics_path.write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
-
-if __name__ == "__main__":
-    main()
