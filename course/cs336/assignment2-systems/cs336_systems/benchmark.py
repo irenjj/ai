@@ -4,14 +4,14 @@ import torch.nn.functional as F
 import timeit
 import statistics
 from contextlib import contextmanager, nullcontext
-import cs336_basics.model
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW
 from einops import rearrange
 import torch.cuda.nvtx as nvtx
+import cs336_basics.model
 
-cs336_basics.model.scaled_dot_product_attention = cs336_basics.model.annotated_scaled_dot_product_attention
+# cs336_basics.model.scaled_dot_product_attention = cs336_basics.model.annotated_scaled_dot_product_attention
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--d-ff", type=int, default=704)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rope-theta", type=float, default=10000.0)
     parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95))
@@ -35,6 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-mode", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--mixed-precision", action="store_true",
                         help="Use CUDA BF16 autocast for forward and loss; keep parameters in FP32")
+    parser.add_argument("--record-memory", action="store_true")
+    parser.add_argument("--replace", action="store_true")
 
 
     args = parser.parse_args()
@@ -54,6 +56,7 @@ def benchmark(
     measure_steps=10,
     optimizer=None,
     mixed_precision=False,
+    record_memory=False,
 ):
     if mode not in (1, 2, 3):
         raise ValueError("mode must be 1, 2, or 3")
@@ -69,27 +72,20 @@ def benchmark(
         with torch.cuda.device(device):
             if not torch.cuda.is_bf16_supported(including_emulation=False):
                 raise ValueError("The selected CUDA device does not support native BF16")
-    model.train()
-
-    def synchronize():
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+    model.train(mode != 1)
 
     stage_times_ms = {name: [] for name in ("forward", "loss", "backward", "optimizer")}
     step_times_ms = []
-
-    def nvtx_range(name):
-        return nvtx.range(name) if device.type == "cuda" else nullcontext()
 
     @contextmanager
     def timed_stage(name, record):
         # 排空此前的 GPU 工作；阶段结束后等待 GPU 完成再停止计时。
         # 预热也执行相同的同步，计时包含 CPU 发起操作和末尾同步的开销。
-        synchronize()
-        with nvtx_range("optimize" if name == "optimizer" else name):
+        torch.cuda.synchronize()
+        with nvtx.range(name):
             start = timeit.default_timer() if record else None
             yield
-            synchronize()
+            torch.cuda.synchronize()
             if record:
                 elapsed_ms = (timeit.default_timer() - start) * 1000
         if record:
@@ -120,26 +116,26 @@ def benchmark(
             with timed_stage("optimizer", record):
                 optimizer.step()
 
-    with torch.enable_grad():
+    with torch.set_grad_enabled(mode != 1):
         # 预热执行相同的阶段和同步，但不加入正式测量样本。
-        synchronize()
+        torch.cuda.synchronize()
         warmup_start = timeit.default_timer()
-        with nvtx_range("warmup"):
+        with nvtx.range("warmup"):
             for _ in range(warmup_steps):
                 model.zero_grad(set_to_none=True)
                 run_step(record=False)
-                synchronize()
+                torch.cuda.synchronize()
         warmup_total_ms = (timeit.default_timer() - warmup_start) * 1000
 
-        synchronize()
+        torch.cuda.synchronize()
         measurement_start = timeit.default_timer()
-        with nvtx_range("measurement"):
+        with nvtx.range("measurement"):
             for _ in range(measure_steps):
                 model.zero_grad(set_to_none=True)
-                synchronize()
+                torch.cuda.synchronize()
                 step_start = timeit.default_timer()
                 run_step(record=True)
-                synchronize()
+                torch.cuda.synchronize()
                 step_times_ms.append((timeit.default_timer() - step_start) * 1000)
         measurement_total_ms = (timeit.default_timer() - measurement_start) * 1000
 
@@ -154,6 +150,10 @@ def benchmark(
             "std_ms": statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0,
             #"times_ms": times_ms,
         }
+
+    if record_memory:
+        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     return {
         "mode": mode,
@@ -187,8 +187,18 @@ def print_metrics(metrics):
 
 def main() -> None:
     args = parse_args()
+
+    if args.replace:
+        cs336_basics.model.scaled_dot_product_attention = cs336_basics.model.annotated_scaled_dot_product_attention       
+
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
+
+    # 在 GPU 输入和模型权重分配前开始记录，保留它们的分配调用栈。
+    if args.record_memory:
+        if device.type != "cuda":
+            raise ValueError("--record-memory requires a CUDA device")
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
 
     n = args.batch_size * args.context_length
     tokens = torch.randint(
@@ -218,7 +228,9 @@ def main() -> None:
         args.warmup_steps,
         args.measure_steps,
         optimizer,
-        mixed_precision=args.mixed_precision)
+        mixed_precision=args.mixed_precision,
+        record_memory=args.record_memory
+    )
 
     print_metrics(metrics)
     
