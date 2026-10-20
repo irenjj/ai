@@ -9,6 +9,7 @@ import warnings
 import einx
 import torch
 import torch.nn as nn
+import torch.cuda.nvtx as nvtx
 from einops import einsum, rearrange
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -432,6 +433,33 @@ def scaled_dot_product_attention(
     attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
 
     return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+
+def annotated_scaled_dot_product_attention(
+    Q: Float[Tensor, " ... queries d_k"],
+    K: Float[Tensor, " ... keys    d_k"],
+    V: Float[Tensor, " ... keys    d_v"],
+    mask: Bool[Tensor, " ... queries keys"] | None = None,
+) -> Float[Tensor, " ... queries d_v"]:
+    d_k = K.shape[-1]
+    with nvtx.range("qk"):
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key")
+
+    with nvtx.range("scale"):
+        attention_scores = attention_scores / math.sqrt(d_k)
+
+    if mask is not None:
+        with nvtx.range("mask"):
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
+
+    with nvtx.range("softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)
+
+    # A is the attention probability matrix, so this operation is A @ V, not K @ V.
+    with nvtx.range("av"):
+        output = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+
+    return output
+
 
 
 class CausalMultiHeadSelfAttention(nn.Module):
